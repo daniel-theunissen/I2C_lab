@@ -65,6 +65,8 @@ void Error_Handler(void);
 #define USART_RX_GPIO_Port GPIOA
 #define LD2_Pin GPIO_PIN_5
 #define LD2_GPIO_Port GPIOA
+#define ACK_Pin GPIO_PIN_5
+#define ACK_GPIO_Port GPIOC
 #define SCL_Pin GPIO_PIN_6
 #define SCL_GPIO_Port GPIOC
 #define SDA_Pin GPIO_PIN_8
