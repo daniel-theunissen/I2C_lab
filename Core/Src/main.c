@@ -21,7 +21,8 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <string.h>
+#include <stdbool.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -31,7 +32,7 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define FAKE_ADDR 0x11
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -45,7 +46,14 @@ TIM_HandleTypeDef htim2;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
+typedef enum {
+	IDLE, START, BIT_CLK_LOW, BIT_CLK_HIGH, ACK_CLK_LOW, ACK_CLK_HIGH, ACK_DECISION, STOP_SCL, STOP_SDA,
+} i2c_state_t;
 
+static volatile i2c_state_t state = IDLE;
+static volatile bool done, acked;
+static uint8_t buf[16], message_len, message_idx, mask;
+const uint8_t msg[] = {0x67, 0x0F};
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -54,7 +62,12 @@ static void MX_GPIO_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
-
+static void i2c_init(void);
+static bool i2c_write(uint8_t addr, const uint8_t *data, uint8_t data_len);
+static inline void scl(int level) {HAL_GPIO_WritePin(GPIOC, SCL_Pin, level ? GPIO_PIN_SET : GPIO_PIN_RESET);}
+static inline void sda_write(int level) {HAL_GPIO_WritePin(GPIOC, SDA_Pin, level ? GPIO_PIN_SET : GPIO_PIN_RESET);}
+static inline void ack(int level) {HAL_GPIO_WritePin(GPIOC, ACK_Pin, level ? GPIO_PIN_SET : GPIO_PIN_RESET);}
+static inline int sda_read(void) {return HAL_GPIO_ReadPin(GPIOC, SDA_Pin);}
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -94,7 +107,7 @@ int main(void)
   MX_TIM2_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
-
+  i2c_init();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -104,6 +117,9 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+	  i2c_write(FAKE_ADDR, msg, sizeof(msg));
+	  while (!done) {}
+	  HAL_Delay(100);
   }
   /* USER CODE END 3 */
 }
@@ -176,7 +192,7 @@ static void MX_TIM2_Init(void)
   htim2.Instance = TIM2;
   htim2.Init.Prescaler = 0;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 364;
+  htim2.Init.Period = 4374;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
   if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
@@ -255,7 +271,7 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_5|SCL_Pin|SDA_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOC, ACK_Pin|SCL_Pin|SDA_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin : B1_Pin */
   GPIO_InitStruct.Pin = B1_Pin;
@@ -270,8 +286,8 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(LD2_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : PC5 SCL_Pin SDA_Pin */
-  GPIO_InitStruct.Pin = GPIO_PIN_5|SCL_Pin|SDA_Pin;
+  /*Configure GPIO pins : ACK_Pin SCL_Pin SDA_Pin */
+  GPIO_InitStruct.Pin = ACK_Pin|SCL_Pin|SDA_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_MEDIUM;
@@ -283,6 +299,90 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+static void i2c_init(void) {
+	// Release all lines
+	scl(1);
+	sda_write(1);
+	ack(1);
+}
+
+static bool i2c_write(uint8_t addr, const uint8_t *data, uint8_t data_len) {
+	if (state != IDLE || data_len > sizeof(buf) - 1) return false; // Only do the write if not busy and buf is big enough
+	buf[0] = addr << 1; // First byte is 7 bit addr then R/W bit, in this case 0
+	memcpy(&buf[1], data, data_len); // Copy n bytes from data to the buffer
+	message_len = data_len + 1;
+	done = false;
+	acked = true;
+	state = START;
+	__HAL_TIM_SET_COUNTER(&htim2, 0); // reset counter from last message
+	HAL_TIM_Base_Start_IT(&htim2);
+	return true;
+}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef* htim)
+{
+	switch (state) {
+	case IDLE:
+		break;
+	case START:
+		sda_write(0); // Pull SDA low while SCL is high to start
+		message_idx = 0;
+		mask = 0b10000000;
+		state = BIT_CLK_LOW;
+		break;
+	case BIT_CLK_LOW:
+		scl(0);
+		sda_write(buf[message_idx] & mask);
+		state = BIT_CLK_HIGH;
+		break;
+	case BIT_CLK_HIGH:
+		scl(1);
+		mask >>= 1; // Go to next bit
+		state = mask ? BIT_CLK_LOW : ACK_CLK_LOW; // if last bit was sent, go to ack
+		break;
+	case ACK_CLK_LOW:
+		scl(0);
+		sda_write(1); // Let go of SDA let "peripheral" ack
+		ack(0); // Always ack
+		state = ACK_CLK_HIGH;
+		break;
+	case ACK_CLK_HIGH:
+		scl(1);
+		state = ACK_DECISION;
+		break;
+	case ACK_DECISION: {
+		// Technically we sample this on the rising edge in the previous state but I need the info here
+		// So that's why it's before scl(0); here
+		bool ack_flag = (sda_read() == GPIO_PIN_RESET);
+		scl(0);
+		if(ack_flag && (message_idx+1) < message_len) {
+			message_idx++;
+			mask = 0b10000000;
+			// We need to continue writing the message here as if it was BIT)CLK_LOW
+			sda_write(buf[message_idx] & mask);
+			state = BIT_CLK_HIGH;
+		} else {
+			acked = ack_flag;
+			sda_write(0);
+			state = STOP_SCL;
+		}
+		ack(1); // Only release this after to prevent glitches
+		break;
+	}
+
+	case STOP_SCL:
+		scl(1);
+		state = STOP_SDA;
+		break;
+	case STOP_SDA:
+		sda_write(1);
+		HAL_TIM_Base_Stop_IT(&htim2);
+		state = IDLE;
+		done = true;
+		break;
+	}
+}
 
 /* USER CODE END 4 */
 
